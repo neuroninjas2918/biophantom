@@ -816,8 +816,8 @@ class _DetectorScreenState extends State<DetectorScreen> {
                 ),
                 const SizedBox(height: 20),
 
-                // Emergency Call Button (only show when ALERT)
-                if (dec == Decision.alert) ...[
+                // Emergency Call Button (show when WARNING or ALERT)
+                if (dec == Decision.warning || dec == Decision.alert) ...[
                   Container(
                     margin: const EdgeInsets.symmetric(horizontal: 16),
                     child: ElevatedButton.icon(

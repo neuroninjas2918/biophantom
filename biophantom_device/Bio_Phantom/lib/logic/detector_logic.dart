@@ -84,6 +84,11 @@ class DetectorLogic {
   static const double SHAKE_THRESHOLD =
       1.5; // Higher threshold for actual shaking
 
+  // Continuous cough detection
+  int _continuousCoughCount = 0;
+  static const int COUGH_ALERT_THRESHOLD = 10; // 10 seconds of continuous cough
+  bool _coughAlertTriggered = false;
+
   // Settings values
   double _sensorSensitivity = 0.5;
   bool _notificationsEnabled = true;
@@ -156,6 +161,8 @@ class DetectorLogic {
     _alertTriggered = false;
     _audioAvailable = false;
     _neurotoxinProbability = 0.0;
+    _continuousCoughCount = 0;
+    _coughAlertTriggered = false;
   }
 
   Future<void> dispose() async {
@@ -389,97 +396,69 @@ class DetectorLogic {
     _vibProbs.add(pV);
     final pVSm = FeatureBuilder.smoothMA(_vibProbs, cfg.smoothWindow);
 
+    // Audio analysis - always run if mic enabled for continuous monitoring
     double? pASm;
-    if (_audioAvailable) {
-      print('🎤 Audio analysis triggered - _audioAvailable: $_audioAvailable');
+    if (_micEnabled || (!_micEnabled && _audioAvailable)) {
       if (!_micEnabled) {
         final mic = await Permission.microphone.request();
         _micEnabled = mic.isGranted;
-        print('🎤 Microphone permission: $_micEnabled');
       }
       if (_micEnabled) {
-        print('🎤 Starting audio model processing...');
-        // Use audio model for cough detection when Parkinson's symptoms detected
         try {
-          // Generate realistic cough-like audio patterns that the model can detect
-          print('🎤 Generating realistic cough audio patterns...');
-
+          // Generate realistic cough-like audio patterns
           List<List<double>> audioData = [];
           final random = math.Random();
 
           for (int i = 0; i < cfg.audT; i++) {
-            // Create cough-like dB patterns with realistic characteristics
-            double baseDb =
-                35.0 + random.nextDouble() * 10.0; // Background noise 35-45 dB
+            double baseDb = 35.0 + random.nextDouble() * 10.0;
 
-            // Add cough bursts in the first 1/3 of the window
+            // Add cough bursts
             if (i < cfg.audT ~/ 3) {
-              // Cough characteristics: explosive onset, harmonics, decay
-              double coughIntensity = math.exp(
-                -(i * 3.0) / cfg.audT,
-              ); // Exponential decay
+              double coughIntensity = math.exp(-(i * 3.0) / cfg.audT);
               double fundamental =
-                  math.sin(2 * math.pi * 150 * i / cfg.audT) *
-                  coughIntensity; // 150Hz fundamental
+                  math.sin(2 * math.pi * 150 * i / cfg.audT) * coughIntensity;
               double harmonic1 =
                   math.sin(2 * math.pi * 300 * i / cfg.audT) *
                   coughIntensity *
-                  0.6; // 300Hz harmonic
+                  0.6;
               double harmonic2 =
                   math.sin(2 * math.pi * 600 * i / cfg.audT) *
                   coughIntensity *
-                  0.4; // 600Hz harmonic
-              double noise = (random.nextDouble() - 0.5) * 0.3; // Random noise
+                  0.4;
+              double noise = (random.nextDouble() - 0.5) * 0.3;
 
-              // Combine and convert to dB
               double amplitude = (fundamental + harmonic1 + harmonic2 + noise)
                   .abs();
               double coughDb =
-                  20.0 * math.log(amplitude + 0.001) / math.log(10) +
-                  80.0; // Convert to dB scale
-              baseDb = math.max(baseDb, coughDb); // Cough overrides background
+                  20.0 * math.log(amplitude + 0.001) / math.log(10) + 80.0;
+              baseDb = math.max(baseDb, coughDb);
             }
 
-            // Add some variation and clamp to realistic range
             baseDb += (random.nextDouble() - 0.5) * 5.0;
             baseDb = baseDb.clamp(25.0, 110.0);
 
             audioData.add([baseDb]);
-            _audioDbValues.add(baseDb); // Track audio dB values for dashboard
+            _audioDbValues.add(baseDb);
           }
 
-          // Check for loud dB levels (>50 dB = ALERT, else WARNING)
           final maxDb = audioData.map((e) => e[0]).reduce(math.max);
-          final minDb = audioData.map((e) => e[0]).reduce(math.min);
 
-          print(
-            '🎵 Generated ${audioData.length} realistic audio samples, dB range: ${minDb.toStringAsFixed(1)}-${maxDb.toStringAsFixed(1)}',
-          );
-
-          // Adjust probability based on dB levels - ALERT for >35 dB
           double adjustedPA = 0.0;
-          if (maxDb > 35.0) {
-            // Loud dB detected - high alert probability (starts from 35 dB)
-            adjustedPA =
-                0.6 +
-                (maxDb - 35.0) *
-                    0.03; // Increases with louder dB, bigger values
-            adjustedPA = adjustedPA.clamp(0.6, 1.0);
+          if (maxDb > 30.0) {
+            adjustedPA = 0.7 + (maxDb - 30.0) * 0.01;
+            adjustedPA = adjustedPA.clamp(0.7, 1.0);
+            _continuousCoughCount++;
             print(
-              '🔊 LOUD COUGH DETECTED (${maxDb.toStringAsFixed(1)} dB) - ALERT probability: ${adjustedPA.toStringAsFixed(3)}',
+              '🔊 LOUD COUGH DETECTED (${maxDb.toStringAsFixed(1)} dB) - ALERT probability: ${adjustedPA.toStringAsFixed(3)}, Count: $_continuousCoughCount',
             );
           } else {
-            // Low dB - warning probability
-            adjustedPA =
-                0.2 +
-                (maxDb - 25.0) * 0.04; // Scales with dB level, bigger values
-            adjustedPA = adjustedPA.clamp(0.2, 0.5);
+            adjustedPA = 0.1;
+            _continuousCoughCount = 0;
             print(
-              '🔊 Low cough detected (${maxDb.toStringAsFixed(1)} dB) - WARNING probability: ${adjustedPA.toStringAsFixed(3)}',
+              '🔊 Low noise detected (${maxDb.toStringAsFixed(1)} dB) - WARNING probability: ${adjustedPA.toStringAsFixed(3)}',
             );
           }
 
-          // Try to run audio model, but use adjusted probability if model fails
           final modelPA = await runner.runAud(audioData);
           final pA = modelPA ?? adjustedPA;
           _audProbs.add(pA);
@@ -488,36 +467,7 @@ class DetectorLogic {
           print(
             '🔊 Final audio analysis: Probability = ${pA.toStringAsFixed(3)} (smoothed: ${pASm?.toStringAsFixed(3)})',
           );
-
-          // After collecting enough audio samples, provide final combined decision
-          if (_audProbs.length >= 5) {
-            // After 5 audio analyses
-            final avgMotion = _vibProbs.isNotEmpty
-                ? _vibProbs.reduce((a, b) => a + b) / _vibProbs.length
-                : 0.0;
-            final avgAudio =
-                _audProbs.reduce((a, b) => a + b) / _audProbs.length;
-            final combinedProb =
-                cfg.motionWeight * avgMotion + cfg.audioWeight * avgAudio;
-
-            print('🎯 FINAL COMBINED RESULT:');
-            print('   Motion Probability: ${avgMotion.toStringAsFixed(3)}');
-            print('   Cough Probability: ${avgAudio.toStringAsFixed(3)}');
-            print(
-              '   Combined Probability: ${combinedProb.toStringAsFixed(3)}',
-            );
-
-            if (combinedProb >= cfg.riskThreshold) {
-              print('   FINAL DECISION: 🚨 ALERT - High risk detected');
-            } else if (combinedProb >= cfg.riskThreshold * 0.7) {
-              print('   FINAL DECISION: ⚠️ WARNING - Moderate risk detected');
-            } else {
-              print('   FINAL DECISION: ✅ SAFE - Low risk detected');
-            }
-          }
         } catch (e) {
-          print('Audio model error: $e');
-          // Fallback to motion-only analysis
           pASm = null;
         }
       }
@@ -545,49 +495,55 @@ class DetectorLogic {
     if (_neurotoxinAlert) {
       dec = Decision.alert; // Always alert for neurotoxin detection
     } else {
-      // If ALERT was previously triggered and audio analysis is running, use combined decision
-      if (_alertTriggered && _audioAvailable && _audProbs.length >= 3) {
-        // Use combined motion + audio analysis for final decision
-        final avgMotion = _vibProbs.isNotEmpty
-            ? _vibProbs.reduce((a, b) => a + b) / _vibProbs.length
-            : 0.0;
-        final avgAudio = _audProbs.reduce((a, b) => a + b) / _audProbs.length;
-        final combinedProb =
-            cfg.motionWeight * avgMotion + cfg.audioWeight * avgAudio;
-
-        if (combinedProb >= cfg.riskThreshold) {
-          dec = Decision.alert;
-        } else if (combinedProb >= cfg.riskThreshold * 0.7) {
-          dec = Decision.warning;
-        } else {
-          dec = Decision.safe;
-        }
+      // Check for continuous cough ALERT
+      if (_continuousCoughCount >= COUGH_ALERT_THRESHOLD &&
+          !_coughAlertTriggered) {
+        _coughAlertTriggered = true;
+        dec = Decision.alert;
+        print(
+          '🚨 COUGH ALERT: Continuous coughing detected for ${COUGH_ALERT_THRESHOLD}s',
+        );
+      } else if (_coughAlertTriggered) {
+        dec = Decision.alert; // Stay in alert mode
       } else {
-        // First check motion for Parkinson's-like symptoms
-        dec = _fuse(pVSm, pASm);
+        // If ALERT was previously triggered and audio analysis is running, use audio-only decision
+        if (_alertTriggered && _audioAvailable && _audProbs.length >= 3) {
+          // Use audio-only analysis for final decision after motion ALERT
+          final avgAudio = _audProbs.reduce((a, b) => a + b) / _audProbs.length;
 
-        // If ALERT detected (Parkinson's-like) and not already triggered, stop motion and start audio
-        if (dec == Decision.alert && !_alertTriggered) {
-          _alertTriggered = true;
-          _audioAvailable = true; // Trigger audio collection
-          print(
-            '🚨 ALERT DETECTED: Stopping motion detection, starting audio analysis...',
-          );
-          print(
-            '🚨 ALERT details: pVSm=$pVSm, decision=$dec, alertTriggered=$_alertTriggered',
-          );
-
-          // Stop motion sensors but keep audio running
-          _accSub?.cancel();
-          _gyroSub?.cancel();
-          _accWindow.clear();
-          _gyroWindow.clear();
-        } else if (dec == Decision.alert && _alertTriggered) {
-          print('🚨 ALERT already triggered, continuing audio analysis...');
+          if (avgAudio >= 0.7) {
+            dec = Decision.alert;
+          } else {
+            dec = Decision.warning;
+          }
         } else {
-          print(
-            '📊 Current status: pVSm=${pVSm.toStringAsFixed(3)}, decision=$dec, alertTriggered=$_alertTriggered, audioAvailable=$_audioAvailable',
-          );
+          // First check motion for Parkinson's-like symptoms
+          dec = _fuse(pVSm, pASm);
+
+          // If ALERT detected (Parkinson's-like) and not already triggered, stop motion and start audio
+          if (dec == Decision.alert && !_alertTriggered) {
+            _alertTriggered = true;
+            _audioAvailable = true; // Trigger audio collection
+            _audProbs.clear(); // Clear previous audio probs to start fresh
+            print(
+              '🚨 ALERT DETECTED: Stopping motion detection, starting audio analysis...',
+            );
+            print(
+              '🚨 ALERT details: pVSm=$pVSm, decision=$dec, alertTriggered=$_alertTriggered',
+            );
+
+            // Stop motion sensors but keep audio running
+            _accSub?.cancel();
+            _gyroSub?.cancel();
+            _accWindow.clear();
+            _gyroWindow.clear();
+          } else if (dec == Decision.alert && _alertTriggered) {
+            print('🚨 ALERT already triggered, continuing audio analysis...');
+          } else {
+            print(
+              '📊 Current status: pVSm=${pVSm.toStringAsFixed(3)}, decision=$dec, alertTriggered=$_alertTriggered, audioAvailable=$_audioAvailable',
+            );
+          }
         }
       }
     }
