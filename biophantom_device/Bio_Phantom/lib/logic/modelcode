@@ -1,0 +1,245 @@
+# BioPhantom one-cell trainer for 3 CSVs: steady/strong, weak, cough
+import os, json, shutil, glob, numpy as np, pandas as pd, tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
+from sklearn.utils.class_weight import compute_class_weight
+
+print("TF", tf.__version__)
+DATA_DIR = "/content/data"; OUT_DIR="/content/models"
+os.makedirs(DATA_DIR, exist_ok=True); os.makedirs(OUT_DIR, exist_ok=True)
+
+# ---- Upload your 3 CSVs ----
+try:
+  from google.colab import files
+  print("Upload: steady(or strong), weak, and cough CSV")
+  up = files.upload()
+  for n in up: shutil.move(f"/content/{n}", f"{DATA_DIR}/{n}")
+  print("Files:", os.listdir(DATA_DIR))
+except: pass
+
+# ---------- Helpers ----------
+def read_csv_robust(p):
+  for enc in ("utf-8-sig","utf-8","latin1"):
+    try:
+      df = pd.read_csv(p, encoding=enc); break
+    except Exception: df=None
+  if df is None: print("[skip] cannot read", p); return None
+  for c in df.columns:
+    if df[c].dtype=='object': df[c]=pd.to_numeric(df[c], errors="coerce")
+  df = df.replace([np.inf,-np.inf], np.nan).ffill().bfill().dropna(how="all")
+  num = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+  return df[num] if num else None
+
+def pick_motion_cols(df):
+  names=[c.lower() for c in df.columns]
+  def grab(keys):
+    got=[]
+    for k in keys:
+      for ci, nm in enumerate(names):
+        if k in nm or nm in k: got.append(df.columns[ci]); break
+    return got
+  acc = grab(["ax","ay","az"]) or grab(["acc_x","acc_y","acc_z"])
+  gyr = grab(["gx","gy","gz"]) or grab(["gyro_x","gyro_y","gyro_z"])
+  cols = (acc+gyr) if len(acc)==3 and len(gyr)==3 else list(df.columns[:6])
+  return cols[:6]
+
+def zscore_lastdim(X):
+  m = X.reshape(-1,X.shape[-1]).mean(0, keepdims=True)
+  s = X.reshape(-1,X.shape[-1]).std(0, keepdims=True)+1e-6
+  return ((X-m)/s).astype(np.float32)
+
+MOTION_WIN=100; MOTION_HOP=50
+
+def make_motion_dataset(steady_path, weak_path):
+  X=[]; y=[]
+  for p,lab in [(steady_path,0),(weak_path,1)]:
+    df=read_csv_robust(p); 
+    if df is None or len(df)<MOTION_WIN: continue
+    cols=pick_motion_cols(df); data=df[cols].values.astype(np.float32)
+    for i in range(0, len(data)-MOTION_WIN+1, MOTION_HOP):
+      win=data[i:i+MOTION_WIN]
+      X.append(win); y.append(lab)
+      # Augment weak class
+      if lab==1:
+        w=win.copy()
+        w+=np.random.normal(0,0.01,w.shape)
+        shift=np.random.randint(-5,6)
+        if shift>0: w=np.vstack([w[shift:], np.repeat(w[-1:], shift, 0)])
+        elif shift<0: s=-shift; w=np.vstack([np.repeat(w[:1], s, 0), w[:-s]])
+        X.append(w); y.append(lab)
+  if not X: return None,None
+  X=np.stack(X); y=np.array(y, np.int32)
+  X=zscore_lastdim(X)
+  return X,y
+
+# ---- Audio: cough vs synthetic no-cough (noise + quiet cough chops) ----
+SR=16000; DUR=2.0; N=int(SR*DUR); FRAME= int(0.025*SR); HOP=int(0.01*SR)
+MELS=40
+def resample1d(x, n):
+  if len(x)==n: return x.astype(np.float32)
+  idx=np.linspace(0,len(x)-1,n).astype(int)
+  out=np.zeros(n, np.float32); out[:]=x[idx[:n]]; return out
+def to_logmel(x):
+  x=resample1d(x, N)
+  stft=tf.signal.stft(x, frame_length=FRAME, frame_step=HOP,
+                      window_fn=tf.signal.hann_window, pad_end=True)
+  mag=tf.abs(stft); nbin=mag.shape[-1]
+  mel_w=tf.signal.linear_to_mel_weight_matrix(MELS, nbin, SR, 80., 4000.)
+  mel=tf.matmul(tf.cast(mag,tf.float32), mel_w)
+  lm=tf.math.log(mel+1e-6).numpy()
+  # time-normalize to 100 frames
+  T=lm.shape[0]
+  if T<100: lm=np.vstack([lm, np.tile(lm[-1:], (100-T,1))])
+  elif T>100: lm=lm[np.linspace(0,T-1,100).astype(int)]
+  m=lm.mean(0,keepdims=True); s=lm.std(0,keepdims=True)+1e-6
+  return ((lm-m)/s).astype(np.float32)
+
+def make_audio_dataset(cough_path):
+  df=read_csv_robust(cough_path); 
+  if df is None: return None, None
+  a=df.values.astype(np.float32)
+  amp = a[:,0] if a.ndim==2 and a.shape[1]>=1 else a.squeeze()
+  amp = amp - np.mean(amp)
+  # positives: chop into 2s windows with hop 1s
+  pos=[]
+  step=int(0.5*SR)  # 0.5s hop for more samples
+  x=resample1d(amp, max(len(amp), N))
+  for i in range(0, len(x)-N+1, step):
+    pos.append(to_logmel(x[i:i+N]))
+  # synthetics: pink-ish noise + quiet randomized cough segments
+  rng=np.random.default_rng(42)
+  neg=[]
+  for _ in range(max(8, len(pos))):
+    # noise
+    white=rng.normal(0, 0.005, N).astype(np.float32)
+    # 1st order lowpass to make it pink-ish
+    for k in range(1,len(white)): white[k]+=0.98*white[k-1]
+    s=white
+    # sometimes mix a very quiet cough fragment
+    if rng.random()<0.5 and len(x)>=N:
+      j=rng.integers(0, max(1,len(x)-N))
+      frag=(0.1*x[j:j+N]).astype(np.float32)
+      s = s*0.7 + frag*0.3
+    neg.append(to_logmel(s))
+  X=np.concatenate([np.stack(pos), np.stack(neg)],0)
+  y=np.array([1]*len(pos) + [0]*len(neg), np.int32)
+  return X,y
+
+# ---------- Build file map ----------
+def find_one(patterns):
+  for p in glob.glob(os.path.join(DATA_DIR,"*.csv")):
+    name=os.path.basename(p).lower()
+    if any(k in name for k in patterns): return p
+  return None
+
+steady_path = find_one(["steady","strong"])
+weak_path   = find_one(["weak"])
+cough_path  = find_one(["cough"])
+print("Found:\n steady/strong:", steady_path, "\n weak:", weak_path, "\n cough:", cough_path)
+
+# ---------- Datasets ----------
+Xm, ym = (make_motion_dataset(steady_path, weak_path) if steady_path and weak_path else (None,None))
+if Xm is not None: print("Motion:", Xm.shape, "pos:", int(ym.sum()), "neg:", int((ym==0).sum()))
+Xa, ya = (make_audio_dataset(cough_path) if cough_path else (None,None))
+if Xa is not None: print("Audio:", Xa.shape, "pos:", int(ya.sum()), "neg:", int((ya==0).sum()))
+
+# ---------- Models ----------
+def motion_model(input_shape=(MOTION_WIN,6)):
+  inp=keras.Input(shape=input_shape)
+  x=layers.Conv1D(64,5,padding="same")(inp); x=layers.BatchNormalization()(x); x=layers.ReLU()(x)
+  x=layers.Conv1D(64,3,padding="same")(x); x=layers.ReLU()(x); x=layers.MaxPooling1D(2)(x)
+  x=layers.Dropout(0.15)(x)
+  x=layers.Conv1D(128,3,padding="same")(x); x=layers.ReLU()(x); x=layers.MaxPooling1D(2)(x)
+  x=layers.Bidirectional(layers.LSTM(64, return_sequences=True))(x)
+  x=layers.Bidirectional(layers.LSTM(32))(x)
+  x=layers.Dense(64, activation="relu")(x); x=layers.Dropout(0.3)(x)
+  out=layers.Dense(1, activation="sigmoid")(x)
+  m=keras.Model(inp,out)
+  m.compile(optimizer=keras.optimizers.Adam(1e-3), loss="binary_crossentropy",
+            metrics=[keras.metrics.AUC(name="auc"), "accuracy"])
+  return m
+
+def audio_model(input_shape=(100,40)):
+  inp=keras.Input(shape=input_shape)
+  x=layers.Conv1D(64,5,padding="same")(inp); x=layers.BatchNormalization()(x); x=layers.ReLU()(x)
+  x=layers.MaxPooling1D(2)(x)
+  x=layers.Conv1D(128,3,padding="same")(x); x=layers.ReLU()(x); x=layers.MaxPooling1D(2)(x)
+  x=layers.GRU(64, return_sequences=True)(x)
+  x=layers.GRU(32)(x)
+  x=layers.Dense(64, activation="relu")(x); x=layers.Dropout(0.3)(x)
+  out=layers.Dense(1, activation="sigmoid")(x)
+  m=keras.Model(inp,out)
+  m.compile(optimizer=keras.optimizers.Adam(1e-3), loss="binary_crossentropy",
+            metrics=[keras.metrics.AUC(name="auc"), "accuracy"])
+  return m
+
+def best_thr(y, p):
+  th=np.linspace(0.2,0.8,61); f1s=[f1_score(y, (p>=t).astype(int), zero_division=0) for t in th]
+  return float(th[int(np.argmax(f1s))])
+
+def to_int8(model, rep, out_path):
+  def rep_gen():
+    for i in range(min(200, len(rep))):
+      yield [rep[i:i+1]]
+  conv=tf.lite.TFLiteConverter.from_keras_model(model)
+  conv.optimizations=[tf.lite.Optimize.DEFAULT]
+  conv.representative_dataset=rep_gen
+  conv.target_spec.supported_ops=[tf.lite.OpsSet.TFLITE_BUILTINS, tf.lite.OpsSet.SELECT_TF_OPS]
+  conv.inference_input_type=tf.int8; conv.inference_output_type=tf.int8
+  tfl=conv.convert(); open(out_path,"wb").write(tfl)
+
+artifacts={"export_dir": OUT_DIR}
+
+# ---- Train motion ----
+if Xm is not None and len(np.unique(ym))>1:
+  Xtr,Xva,ytr,yva=train_test_split(Xm,ym,test_size=0.2,random_state=42, stratify=ym)
+  classes=np.unique(ytr); cw=compute_class_weight('balanced', classes=classes, y=ytr)
+  cw={int(c):float(w) for c,w in zip(classes,cw)}
+  m=motion_model(Xm.shape[1:])
+  cbs=[keras.callbacks.EarlyStopping(patience=8, restore_best_weights=True, monitor="val_auc", mode="max"),
+       keras.callbacks.ReduceLROnPlateau(factor=0.5, patience=3, monitor="val_auc", mode="max")]
+  m.fit(Xtr,ytr,validation_data=(Xva,yva),epochs=60,batch_size=64,class_weight=cw,callbacks=cbs,verbose=1)
+  pm=m.predict(Xva, verbose=0).flatten(); thr=best_thr(yva, pm)
+  print("[motion] AUC", roc_auc_score(yva,pm), "PR", average_precision_score(yva,pm), "thr", thr)
+  open(f"{OUT_DIR}/motion_threshold.txt","w").write(f"{thr:.4f}")
+  to_int8(m, Xtr, f"{OUT_DIR}/biophantom_motion_int8.tflite")
+  artifacts["motion"]={"trained":True,"model_file":"biophantom_motion_int8.tflite","threshold":thr}
+else:
+  print("[motion] not enough data"); artifacts["motion"]={"trained":False}
+
+# ---- Train audio (with synthetic negatives) ----
+if Xa is not None and len(np.unique(ya))>1:
+  Xtr,Xva,ytr,yva=train_test_split(Xa,ya,test_size=0.2,random_state=42, stratify=ya)
+  classes=np.unique(ytr); cw=compute_class_weight('balanced', classes=classes, y=ytr)
+  cw={int(c):float(w) for c,w in zip(classes,cw)}
+  am=audio_model(Xa.shape[1:])
+  cbs=[keras.callbacks.EarlyStopping(patience=8, restore_best_weights=True, monitor="val_auc", mode="max"),
+       keras.callbacks.ReduceLROnPlateau(factor=0.5, patience=3, monitor="val_auc", mode="max")]
+  am.fit(Xtr,ytr,validation_data=(Xva,yva),epochs=60,batch_size=64,class_weight=cw,callbacks=cbs,verbose=1)
+  pa=am.predict(Xva, verbose=0).flatten(); athr=best_thr(yva, pa)
+  print("[audio] AUC", roc_auc_score(yva,pa), "PR", average_precision_score(yva,pa), "thr", athr)
+  open(f"{OUT_DIR}/audio_threshold.txt","w").write(f"{athr:.4f}")
+  to_int8(am, Xtr, f"{OUT_DIR}/biophantom_audio_int8.tflite")
+  artifacts["audio"]={"trained":True,"model_file":"biophantom_audio_int8.tflite","threshold":athr}
+else:
+  print("[audio] not enough data (even with synthetics)"); artifacts["audio"]={"trained":False}
+
+# ---- Fusion config ----
+motion_w=0.7 if artifacts["motion"]["trained"] else 0.0
+audio_w =0.3 if artifacts["audio"]["trained"] else 0.0
+fusion={"gate":"motion" if artifacts["motion"]["trained"] else "none",
+        "fusion":f"{motion_w}*motion + {audio_w}*audio",
+        "riskThreshold":0.50}
+json.dump(fusion, open(f"{OUT_DIR}/fusion_config.json","w"), indent=2)
+
+print("\n=== Artifacts ==="); print(json.dumps(artifacts, indent=2))
+print("Saved to", OUT_DIR)
+
+# Download links
+from google.colab import files
+for fname in ["biophantom_motion_int8.tflite","motion_threshold.txt",
+              "biophantom_audio_int8.tflite","audio_threshold.txt","fusion_config.json"]:
+  p=os.path.join(OUT_DIR,fname)
+  if os.path.exists(p): files.download(p)
