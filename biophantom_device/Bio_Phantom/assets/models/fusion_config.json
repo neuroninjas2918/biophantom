@@ -1,0 +1,5 @@
+{
+  "motionWeight": 0.7,
+  "audioWeight": 0.3,
+  "riskThreshold": 0.3
+}
